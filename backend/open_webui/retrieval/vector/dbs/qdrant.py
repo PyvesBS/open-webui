@@ -23,7 +23,7 @@ from open_webui.retrieval.vector.main import (
     VectorDBBase,
     VectorItem,
 )
-from open_webui.retrieval.vector.utils import iter_filter_conditions, process_metadata
+from open_webui.retrieval.vector.utils import iter_filter_conditions, merge_hybrid_search_results, process_metadata
 from qdrant_client import QdrantClient as Qclient
 from qdrant_client.http.models import PointStruct
 from qdrant_client.models import models
@@ -69,6 +69,33 @@ def _bm25_index_params(on_disk: bool) -> models.TextIndexParams:
     )
 
 
+def _has_bm25_index(client: Qclient, collection: str) -> bool:
+    schema = client.get_collection(collection).payload_schema.get(BM25_FIELD)
+    return schema is not None and getattr(schema.params, 'scoring', None) is not None
+
+
+def _bm25_search(
+    client: Qclient,
+    collection: str,
+    query: str,
+    query_filter: Optional[models.Filter],
+    limit: int,
+    idf_corpus: Optional[models.Filter] = None,
+) -> list[dict]:
+    response = client.query_points(
+        collection_name=collection,
+        query=models.TextQuery(text=query),
+        using=BM25_FIELD,
+        query_filter=query_filter,
+        search_params=models.SearchParams(idf=models.IdfCorpusParams(corpus=idf_corpus)) if idf_corpus else None,
+        limit=limit,
+    )
+    return [
+        {'id': point.id, 'text': point.payload['text'], 'vmetadata': point.payload['metadata']}
+        for point in response.points
+    ]
+
+
 class QdrantClient(VectorDBBase):
     def __init__(self):
         self.collection_prefix = QDRANT_COLLECTION_PREFIX
@@ -80,6 +107,8 @@ class QdrantClient(VectorDBBase):
         self.QDRANT_TIMEOUT = QDRANT_TIMEOUT
         self.QDRANT_HNSW_M = QDRANT_HNSW_M
 
+        # Collections whose BM25 index is complete.
+        self.bm25_ready: set[str] = set()
         if not self.QDRANT_URI:
             self.client = None
             self.supports_bm25 = False
@@ -184,6 +213,7 @@ class QdrantClient(VectorDBBase):
                 field_name=BM25_FIELD,
                 field_schema=_bm25_index_params(self.QDRANT_ON_DISK),
             )
+            self.bm25_ready.add(collection_name_with_prefix)
         log.info('collection %s successfully created!', collection_name_with_prefix)
 
     def _create_collection_if_not_exists(self, collection_name, dimension):
@@ -232,6 +262,41 @@ class QdrantClient(VectorDBBase):
             metadatas=get_result.metadatas,
             # qdrant distance is [-1, 1], normalize to [0, 1]
             distances=[[(point.score + 1.0) / 2.0 for point in query_response.points]],
+        )
+
+    def hybrid_search(
+        self,
+        collection_name: str,
+        query: str,
+        vectors: list[list[float | int]],
+        filter: Optional[dict] = None,
+        limit: int = 10,
+        hybrid_bm25_weight: float = 0.5,
+    ) -> Optional[SearchResult]:
+        collection_name_full = f'{self.collection_prefix}_{collection_name}'
+        if not self.supports_bm25 or not self.has_collection(collection_name):
+            return None
+        if collection_name_full not in self.bm25_ready:
+            if not _has_bm25_index(self.client, collection_name_full):
+                return None
+            self.bm25_ready.add(collection_name_full)
+
+        vector_result = None
+        if hybrid_bm25_weight < 1 and vectors:
+            vector_result = self.search(collection_name=collection_name, vectors=vectors, filter=filter, limit=limit)
+
+        fts_results = []
+        if hybrid_bm25_weight > 0 and query.strip():
+            conditions = [_metadata_filter(key, op, value) for key, op, value in iter_filter_conditions(filter)]
+            query_filter = models.Filter(must=conditions) if conditions else None
+            fts_results = _bm25_search(self.client, collection_name_full, query, query_filter, limit)
+
+        return merge_hybrid_search_results(
+            vector_result=vector_result,
+            fts_results=fts_results,
+            num_queries=len(vectors) or 1,
+            limit=limit,
+            hybrid_bm25_weight=hybrid_bm25_weight,
         )
 
     def query(self, collection_name: str, filter: dict, limit: Optional[int] = None):

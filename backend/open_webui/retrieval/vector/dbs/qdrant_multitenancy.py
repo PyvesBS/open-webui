@@ -20,6 +20,8 @@ from open_webui.config import (
 from open_webui.retrieval.vector.dbs.qdrant import (
     BM25_FIELD,
     _bm25_index_params,
+    _bm25_search,
+    _has_bm25_index,
     _supports_bm25,
 )
 from open_webui.retrieval.vector.main import (
@@ -28,7 +30,7 @@ from open_webui.retrieval.vector.main import (
     VectorDBBase,
     VectorItem,
 )
-from open_webui.retrieval.vector.utils import iter_filter_conditions, process_metadata
+from open_webui.retrieval.vector.utils import iter_filter_conditions, merge_hybrid_search_results, process_metadata
 from qdrant_client import QdrantClient as Qclient
 from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.http.models import PointStruct
@@ -87,6 +89,8 @@ class QdrantClient(VectorDBBase):
             )
         )
         self.supports_bm25 = _supports_bm25(self.client)
+        # Collections whose BM25 index is complete.
+        self.bm25_ready: set[str] = set()
 
         # Main collection types for multi-tenancy
         self.MEMORY_COLLECTION = f'{self.collection_prefix}_memories'
@@ -199,6 +203,7 @@ class QdrantClient(VectorDBBase):
                 field_name=BM25_FIELD,
                 field_schema=_bm25_index_params(self.QDRANT_ON_DISK),
             )
+            self.bm25_ready.add(mt_collection_name)
 
     def _create_points(self, items: List[VectorItem], tenant_id: str) -> List[PointStruct]:
         """
@@ -303,6 +308,47 @@ class QdrantClient(VectorDBBase):
             documents=get_result.documents,
             metadatas=get_result.metadatas,
             distances=[[(point.score + 1.0) / 2.0 for point in query_response.points]],
+        )
+
+    def hybrid_search(
+        self,
+        collection_name: str,
+        query: str,
+        vectors: List[List[float | int]],
+        filter: Optional[Dict] = None,
+        limit: int = 10,
+        hybrid_bm25_weight: float = 0.5,
+    ) -> Optional[SearchResult]:
+        if not self.client or not self.supports_bm25:
+            return None
+        mt_collection, tenant_id = self._get_collection_and_tenant_id(collection_name)
+        if not self.client.collection_exists(collection_name=mt_collection):
+            return None
+        if mt_collection not in self.bm25_ready:
+            if not _has_bm25_index(self.client, mt_collection):
+                return None
+            self.bm25_ready.add(mt_collection)
+
+        vector_result = None
+        if hybrid_bm25_weight < 1 and vectors:
+            vector_result = self.search(collection_name=collection_name, vectors=vectors, filter=filter, limit=limit)
+
+        fts_results = []
+        if hybrid_bm25_weight > 0 and query.strip():
+            tenant = models.Filter(must=[_tenant_filter(tenant_id)])
+            conditions = [_tenant_filter(tenant_id)]
+            conditions.extend(_metadata_filter(key, op, value) for key, op, value in iter_filter_conditions(filter))
+            # Term statistics come from the tenant alone, as in a collection of its own.
+            fts_results = _bm25_search(
+                self.client, mt_collection, query, models.Filter(must=conditions), limit, idf_corpus=tenant
+            )
+
+        return merge_hybrid_search_results(
+            vector_result=vector_result,
+            fts_results=fts_results,
+            num_queries=len(vectors) or 1,
+            limit=limit,
+            hybrid_bm25_weight=hybrid_bm25_weight,
         )
 
     def query(self, collection_name: str, filter: Dict[str, Any], limit: Optional[int] = None):
