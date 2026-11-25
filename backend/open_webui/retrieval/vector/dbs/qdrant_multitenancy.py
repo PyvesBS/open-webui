@@ -17,10 +17,12 @@ from open_webui.config import (
     QDRANT_TIMEOUT,
     QDRANT_URI,
 )
+from open_webui.env import ENABLE_DB_MIGRATIONS
 from open_webui.retrieval.vector.dbs.qdrant import (
     BM25_FIELD,
     _bm25_index_params,
     _bm25_search,
+    _create_bm25_indexes,
     _has_bm25_index,
     _supports_bm25,
 )
@@ -91,6 +93,10 @@ class QdrantClient(VectorDBBase):
         self.supports_bm25 = _supports_bm25(self.client)
         # Collections whose BM25 index is complete.
         self.bm25_ready: set[str] = set()
+        if ENABLE_DB_MIGRATIONS and self.supports_bm25:
+            _create_bm25_indexes(
+                self.QDRANT_URI, self.QDRANT_API_KEY, self.collection_prefix, self.QDRANT_ON_DISK, self.bm25_ready
+            )
 
         # Main collection types for multi-tenancy
         self.MEMORY_COLLECTION = f'{self.collection_prefix}_memories'

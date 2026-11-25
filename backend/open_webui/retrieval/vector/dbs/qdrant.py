@@ -4,6 +4,7 @@ NOTE: This vector database integration is community-supported and maintained on 
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -17,6 +18,7 @@ from open_webui.config import (
     QDRANT_TIMEOUT,
     QDRANT_URI,
 )
+from open_webui.env import ENABLE_DB_MIGRATIONS
 from open_webui.retrieval.vector.main import (
     GetResult,
     SearchResult,
@@ -33,6 +35,9 @@ SCROLL_PAGE_SIZE = 1000
 
 BM25_FIELD = 'text'
 BM25_MIN_QDRANT_VERSION = (1, 20, 0)
+BM25_INDEX_WORKERS = 8
+# Seconds; building the index of a large collection takes minutes.
+BM25_INDEX_TIMEOUT = 24 * 3600
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +101,46 @@ def _bm25_search(
     ]
 
 
+def _create_bm25_indexes(uri: str, api_key: Optional[str], collection_prefix: str, on_disk: bool, ready: set[str]):
+    """Builds the missing BM25 indexes and returns once every index is complete."""
+    client = Qclient(url=uri, api_key=api_key, timeout=BM25_INDEX_TIMEOUT)
+    collections = [
+        collection.name
+        for collection in client.get_collections().collections
+        if collection.name.startswith(f'{collection_prefix}_')
+    ]
+    with ThreadPoolExecutor(max_workers=BM25_INDEX_WORKERS) as executor:
+        builds = {
+            collection: executor.submit(_create_bm25_index, client, collection, on_disk) for collection in collections
+        }
+    ready.update(collection for collection, build in builds.items() if build.result())
+
+
+def _create_bm25_index(client: Qclient, collection: str, on_disk: bool) -> bool:
+    try:
+        params = _bm25_index_params(on_disk)
+        current = client.get_collection(collection).payload_schema.get(BM25_FIELD)
+        built = current is not None and getattr(current.params, 'scoring', None) is not None
+        changed = built and any(
+            getattr(current.params, setting, None) != value
+            for setting, value in params.model_dump(exclude_unset=True, exclude={'type', 'scoring'}).items()
+        )
+        if not built:
+            log.info('Building the BM25 index of Qdrant collection %s.', collection)
+        elif changed:
+            log.info('Rebuilding the BM25 index of Qdrant collection %s with new settings.', collection)
+        # Returns once the index is complete, including when another worker started building it.
+        result = client.create_payload_index(collection, BM25_FIELD, params, wait=True, timeout=BM25_INDEX_TIMEOUT)
+        if result.status != models.UpdateStatus.COMPLETED:
+            raise RuntimeError(f'index build {result.status.value}')
+        if not built or changed:
+            log.info('BM25 index of Qdrant collection %s built.', collection)
+        return True
+    except Exception as e:
+        log.error('Could not build the BM25 index of Qdrant collection %s, will retry on next start: %s', collection, e)
+        return False
+
+
 class QdrantClient(VectorDBBase):
     def __init__(self):
         self.collection_prefix = QDRANT_COLLECTION_PREFIX
@@ -136,6 +181,10 @@ class QdrantClient(VectorDBBase):
                 timeout=QDRANT_TIMEOUT,
             )
         self.supports_bm25 = _supports_bm25(self.client)
+        if ENABLE_DB_MIGRATIONS and self.supports_bm25:
+            _create_bm25_indexes(
+                self.QDRANT_URI, self.QDRANT_API_KEY, self.collection_prefix, self.QDRANT_ON_DISK, self.bm25_ready
+            )
 
     def _result_to_get_result(self, points) -> GetResult:
         ids = []
