@@ -17,6 +17,11 @@ from open_webui.config import (
     QDRANT_TIMEOUT,
     QDRANT_URI,
 )
+from open_webui.retrieval.vector.dbs.qdrant import (
+    BM25_FIELD,
+    _bm25_index_params,
+    _supports_bm25,
+)
 from open_webui.retrieval.vector.main import (
     GetResult,
     SearchResult,
@@ -81,6 +86,7 @@ class QdrantClient(VectorDBBase):
                 timeout=self.QDRANT_TIMEOUT,
             )
         )
+        self.supports_bm25 = _supports_bm25(self.client)
 
         # Main collection types for multi-tenancy
         self.MEMORY_COLLECTION = f'{self.collection_prefix}_memories'
@@ -186,6 +192,12 @@ class QdrantClient(VectorDBBase):
                     type=models.KeywordIndexType.KEYWORD,
                     on_disk=self.QDRANT_ON_DISK,
                 ),
+            )
+        if self.supports_bm25:
+            self.client.create_payload_index(
+                collection_name=mt_collection_name,
+                field_name=BM25_FIELD,
+                field_schema=_bm25_index_params(self.QDRANT_ON_DISK),
             )
 
     def _create_points(self, items: List[VectorItem], tenant_id: str) -> List[PointStruct]:

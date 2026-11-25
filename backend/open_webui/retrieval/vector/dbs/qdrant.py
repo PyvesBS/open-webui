@@ -3,6 +3,7 @@ NOTE: This vector database integration is community-supported and maintained on 
 """
 
 import logging
+import re
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -30,12 +31,42 @@ from qdrant_client.models import models
 NO_LIMIT = 999999999
 SCROLL_PAGE_SIZE = 1000
 
+BM25_FIELD = 'text'
+BM25_MIN_QDRANT_VERSION = (1, 20, 0)
+
 log = logging.getLogger(__name__)
 
 
 def _metadata_filter(key: str, op: str, value: Any) -> models.FieldCondition:
     match = models.MatchAny(any=value) if op == '$in' else models.MatchValue(value=value)
     return models.FieldCondition(key=f'metadata.{key}', match=match)
+
+
+def _supports_bm25(client: Qclient) -> bool:
+    try:
+        version = client.info().version
+    except Exception as e:
+        log.warning('Could not read the Qdrant version, native hybrid search stays off: %s', e)
+        return False
+    if tuple(int(part) for part in re.findall(r'\d+', version)[:3]) < BM25_MIN_QDRANT_VERSION:
+        log.info(
+            'Qdrant %s has no BM25 on full-text indexes (needs %s+), native hybrid search stays off.',
+            version,
+            '.'.join(map(str, BM25_MIN_QDRANT_VERSION[:2])),
+        )
+        return False
+    return True
+
+
+def _bm25_index_params(on_disk: bool) -> models.TextIndexParams:
+    return models.TextIndexParams(
+        type=models.TextIndexType.TEXT,
+        tokenizer=models.TokenizerType.WORD,
+        lowercase=True,
+        ascii_folding=True,
+        on_disk=on_disk,
+        scoring=True,
+    )
 
 
 class QdrantClient(VectorDBBase):
@@ -51,6 +82,7 @@ class QdrantClient(VectorDBBase):
 
         if not self.QDRANT_URI:
             self.client = None
+            self.supports_bm25 = False
             return
 
         # Unified handling for either scheme
@@ -74,6 +106,7 @@ class QdrantClient(VectorDBBase):
                 api_key=self.QDRANT_API_KEY,
                 timeout=QDRANT_TIMEOUT,
             )
+        self.supports_bm25 = _supports_bm25(self.client)
 
     def _result_to_get_result(self, points) -> GetResult:
         ids = []
@@ -145,6 +178,12 @@ class QdrantClient(VectorDBBase):
                 on_disk=self.QDRANT_ON_DISK,
             ),
         )
+        if self.supports_bm25:
+            self.client.create_payload_index(
+                collection_name=collection_name_with_prefix,
+                field_name=BM25_FIELD,
+                field_schema=_bm25_index_params(self.QDRANT_ON_DISK),
+            )
         log.info('collection %s successfully created!', collection_name_with_prefix)
 
     def _create_collection_if_not_exists(self, collection_name, dimension):
