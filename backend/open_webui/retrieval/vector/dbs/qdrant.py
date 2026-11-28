@@ -75,8 +75,12 @@ def _bm25_index_params(on_disk: bool) -> models.TextIndexParams:
 
 
 def _has_bm25_index(client: Qclient, collection: str) -> bool:
-    schema = client.get_collection(collection).payload_schema.get(BM25_FIELD)
-    return schema is not None and getattr(schema.params, 'scoring', None) is not None
+    info = client.get_collection(collection)
+    schema = info.payload_schema.get(BM25_FIELD)
+    if schema is None or getattr(schema.params, 'scoring', None) is None:
+        return False
+    # The index shows in the schema as soon as its build starts; the build stays queued until it is complete.
+    return not (info.update_queue and info.update_queue.length)
 
 
 def _bm25_search(
